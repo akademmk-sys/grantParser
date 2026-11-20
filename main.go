@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/gocolly/colly/v2"
+	"github.com/xuri/excelize/v2"
 )
 
 type Product struct {
@@ -15,7 +16,7 @@ type Product struct {
 	PLink       string
 	ImgLink     string
 	Price       string
-	PartNumber  string
+	Article     string
 	Brand       string
 	Description string
 }
@@ -35,9 +36,9 @@ func errorHandler(r *colly.Response, err error) {
 	if v != "" {
 		retryCount, _ = strconv.Atoi(v)
 	}
-	if retryCount < 3 {
+	if retryCount < 5 {
 		retryCount++
-		fmt.Printf("retry request (%d/3) on URL: %s\n", retryCount, r.Request.URL)
+		fmt.Printf("retry request (%d/5) on URL: %s\n", retryCount, r.Request.URL)
 		r.Request.Ctx.Put("retry_count", strconv.Itoa(retryCount))
 		r.Request.Retry()
 	}
@@ -79,22 +80,6 @@ func main() {
 		Parallelism: 2,
 	})
 
-	tumbColl.OnHTML("div#table-data-pagination a.pages_n", func(h *colly.HTMLElement) {
-		n, err := strconv.Atoi(h.Attr("rel"))
-		if err != nil {
-			return
-		}
-
-		u := h.Request.URL
-		key := u.Scheme + "://" + u.Host + u.Path
-
-		mu.Lock()
-		if cat, ok := DATA[key]; ok && n > cat.Pages {
-			cat.Pages = n
-		}
-		mu.Unlock()
-	})
-
 	tumbColl.OnHTML(`tr[itemprop="itemListElement"] td>a`, func(h *colly.HTMLElement) {
 		currentURL := h.Request.URL
 		baseSupCategryURl := currentURL.Scheme + "://" + currentURL.Host + currentURL.Path
@@ -112,7 +97,69 @@ func main() {
 		mu.Unlock()
 	})
 
+	tumbColl.OnHTML(`link[rel="next"]`, func(h *colly.HTMLElement) {
+		next := h.Request.AbsoluteURL(h.Attr("href"))
+		if next != "" {
+			tumbColl.Visit(next)
+		}
+	})
+
 	detColl := tumbColl.Clone()
+	detColl.OnHTML("div.catalog", func(h *colly.HTMLElement) {
+		var brand, price, article string
+		h.ForEach("div.group", func(_ int, h *colly.HTMLElement) {
+			key := strings.TrimSuffix(h.ChildText("div.group label.w_200"), ":")
+			if key == "" {
+				return
+			}
+			val := h.ChildText("label.w_200 + span")
+			switch key {
+			case "Артикул":
+				article = val
+			case "Производитель":
+				brand = val
+			case "Цена за упаковку":
+				price = val
+			}
+		})
+
+		rowImgLinks := h.ChildAttrs("a.big_img", "href")
+		fullImgLinks := make([]string, 0, len(rowImgLinks))
+		for _, el := range rowImgLinks {
+			trimmed := strings.TrimSpace(el)
+			fullImgLinks = append(fullImgLinks, h.Request.AbsoluteURL(trimmed))
+		}
+		productImgLinks := strings.Join(fullImgLinks, "\n")
+
+		disc := h.ChildText(`[itemprop="description"]`)
+		var specs []string
+		h.ForEach(`[itemprop="description"] + .box ul > li`, func(_ int, h *colly.HTMLElement) {
+			s := strings.Replace(h.Text, " : ", ": ", 1)
+			if s != "" {
+				specs = append(specs, s)
+			}
+		})
+		discription := disc
+		if len(specs) > 0 {
+			discription += "\n\nХарактеристики:\n" + strings.Join(specs, "\n")
+		}
+
+		catKey := h.Request.Ctx.Get("cat")
+		link := h.Request.Ctx.Get("link")
+
+		mu.Lock()
+		if cat, ok := DATA[catKey]; ok {
+			if p, ok := cat.Products[link]; ok {
+				p.ImgLink = productImgLinks
+				p.Brand = brand
+				p.Article = article
+				p.Price = price
+				p.Description = discription
+				cat.Products[link] = p
+			}
+		}
+		mu.Unlock()
+	})
 
 	catColl.OnError(errorHandler)
 	tumbColl.OnError(errorHandler)
@@ -125,10 +172,49 @@ func main() {
 	}
 	tumbColl.Wait()
 
-	for l, cat := range DATA {
-		for i := 2; i <= cat.Pages; i++ {
-			tumbColl.Visit(fmt.Sprintf("%s?page=%d", l, i))
+	for catKey, cat := range DATA {
+		for link := range cat.Products {
+			ctx := colly.NewContext()
+			ctx.Put("cat", catKey)
+			ctx.Put("link", link)
+			if err := detColl.Request("GET", link, nil, ctx, nil); err != nil {
+				fmt.Println("visit:", link, err)
+			}
 		}
 	}
-	tumbColl.Wait()
+	detColl.Wait()
+
+	exl := excelize.NewFile()
+	defer func() {
+		if err := exl.Close(); err != nil {
+			fmt.Println(err)
+		}
+	}()
+
+	exl.SetCellValue("Sheet1", "A1", "Категория")
+	exl.SetCellValue("Sheet1", "B1", "Ссылка на категрию")
+	exl.SetCellValue("Sheet1", "C1", "Товар")
+	exl.SetCellValue("Sheet1", "D1", "Ссылка на товар")
+	exl.SetCellValue("Sheet1", "E1", "Ссылка на картинку")
+	exl.SetCellValue("Sheet1", "F1", "Цена")
+	exl.SetCellValue("Sheet1", "G1", "Артикул")
+	exl.SetCellValue("Sheet1", "H1", "Брэнд")
+	exl.SetCellValue("Sheet1", "I1", "Описание")
+
+	row := 2
+	for _, cat := range DATA {
+		for _, prod := range cat.Products {
+			exl.SetCellValue("Sheet1", "A"+strconv.Itoa(row), cat.Name)
+			exl.SetCellValue("Sheet1", "B"+strconv.Itoa(row), cat.Link)
+			exl.SetCellValue("Sheet1", "C"+strconv.Itoa(row), prod.PName)
+			exl.SetCellValue("Sheet1", "D"+strconv.Itoa(row), prod.PLink)
+			exl.SetCellValue("Sheet1", "E"+strconv.Itoa(row), prod.ImgLink)
+			exl.SetCellValue("Sheet1", "F"+strconv.Itoa(row), prod.Price)
+			exl.SetCellValue("Sheet1", "G"+strconv.Itoa(row), prod.Article)
+			exl.SetCellValue("Sheet1", "H"+strconv.Itoa(row), prod.Brand)
+			exl.SetCellValue("Sheet1", "I"+strconv.Itoa(row), prod.Description)
+			row++
+		}
+	}
+	exl.SaveAs("grant_db.xlsx")
 }
